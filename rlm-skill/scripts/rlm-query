@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+# rlm-query - Spawn a recursive Claude Code sub-agent
+#
+# Each sub-agent is a full Claude Code instance that can use tools,
+# write code, examine files, and (if below max depth) call rlm-query itself.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# --- Config (inherited through recursion via env) ---
+MAX_DEPTH="${RLM_MAX_DEPTH:-3}"
+DEPTH="${RLM_DEPTH:-0}"
+TIMEOUT="${RLM_TIMEOUT:-1200}"
+MODEL="${RLM_MODEL:-opus}"
+MAX_PARALLEL="${RLM_MAX_PARALLEL:-15}"
+TASK="${RLM_TASK:-}"
+
+# --- Parse args ---
+PROMPT_FILE=""
+OUTPUT_FILE=""
+CONTEXT=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --context|-c) CONTEXT="$2"; shift 2 ;;
+        --max-depth)  MAX_DEPTH="$2"; shift 2 ;;
+        --timeout)    TIMEOUT="$2"; shift 2 ;;
+        --model|-m)   MODEL="$2"; shift 2 ;;
+        --task|-t)    TASK="$2"; shift 2 ;;
+        --max-parallel) MAX_PARALLEL="$2"; shift 2 ;;
+        -h|--help)
+            cat >&2 << 'USAGE'
+rlm-query - Recursive Language Model sub-agent
+
+Usage: rlm-query <prompt_file> <output_file> [options]
+
+Options:
+  --context, -c FILE    Context file for the sub-agent
+  --max-depth N         Max recursion depth (default: 3)
+  --max-parallel N      Max concurrent Claude instances across task tree (default: 15)
+  --timeout N           Timeout in seconds (default: 1200)
+  --model, -m MODEL     Model for sub-agents (e.g. sonnet, opus)
+  --task, -t NAME       Task name for organizing working files under .rlm/<name>/
+
+Environment (auto-inherited by sub-agents):
+  RLM_DEPTH          Current depth (auto-managed)
+  RLM_MAX_DEPTH      Maximum depth
+  RLM_MAX_PARALLEL   Max concurrent Claude instances (default: 15)
+  RLM_TIMEOUT        Timeout per query
+  RLM_MODEL          Model for sub-agents
+  RLM_TASK           Task name (auto-inherited)
+USAGE
+            exit 0 ;;
+        *)
+            if [ -z "$PROMPT_FILE" ]; then PROMPT_FILE="$1"
+            elif [ -z "$OUTPUT_FILE" ]; then OUTPUT_FILE="$1"
+            fi
+            shift ;;
+    esac
+done
+
+if [ -z "$PROMPT_FILE" ] || [ -z "$OUTPUT_FILE" ]; then
+    echo "Usage: rlm-query <prompt_file> <output_file> [--context FILE]" >&2
+    exit 1
+fi
+
+# --- Resolve paths ---
+PROMPT_FILE="$(realpath "$PROMPT_FILE")"
+mkdir -p "$(dirname "$OUTPUT_FILE")"
+touch "$OUTPUT_FILE"
+OUTPUT_FILE="$(realpath "$OUTPUT_FILE")"
+rm -f "$OUTPUT_FILE"
+[ -n "$CONTEXT" ] && CONTEXT="$(realpath "$CONTEXT")"
+
+CWD="$(pwd)"
+
+# --- Task workspace ---
+if [ -z "$TASK" ]; then
+    TASK="run-$(date +%Y%m%d-%H%M%S)"
+fi
+TASK_DIR="${CWD}/.rlm/${TASK}"
+mkdir -p "$TASK_DIR"
+
+# --- Slots directory (shared across all agents in this task tree) ---
+SLOTS_DIR="${TASK_DIR}/slots"
+mkdir -p "$SLOTS_DIR"
+
+# --- Session setup ---
+SESSION_ID="rlm-${TASK}-d${DEPTH}-${RANDOM}${RANDOM}"
+SESSION_DIR="${TASK_DIR}/sessions/${SESSION_ID}"
+mkdir -p "$SESSION_DIR"
+
+NEXT_DEPTH=$((DEPTH + 1))
+
+# --- Build claude command ---
+CLAUDE_CMD="claude --dangerously-skip-permissions"
+if [ -n "$MODEL" ]; then
+    CLAUDE_CMD="${CLAUDE_CMD} --model ${MODEL}"
+fi
+
+# --- Build sub-agent prompt ---
+SUB_PROMPT="${SESSION_DIR}/prompt.md"
+
+PROMPTS_DIR="${SCRIPT_DIR}/../prompts"
+
+{
+    # 1. RLM reference instructions first (fixed prefix — enables prompt caching
+    #    across all sub-agents sharing the same rlm-agent.md content)
+    sed -e "s|{{TASK_DIR}}|${TASK_DIR}|g" \
+        "${PROMPTS_DIR}/rlm-agent.md"
+    echo ""
+    echo "---"
+    echo ""
+
+    # 2. Role header (agent focuses here due to recency)
+    if [ "$DEPTH" -eq 0 ]; then
+        echo "You are the root orchestrator of an RLM (Recursive Language Model) task at depth ${DEPTH}/${MAX_DEPTH}."
+        echo "Your job is to break down the task below, delegate work to sub-agents, and aggregate their results into a final answer."
+        echo "Print your final answer to stdout."
+    elif [ "$NEXT_DEPTH" -gt "$MAX_DEPTH" ]; then
+        echo "You are a leaf sub-agent in an RLM chain at depth ${DEPTH}/${MAX_DEPTH}. You cannot spawn further sub-agents."
+        echo "Follow the task below and print your answer directly to stdout. Do not write to files."
+    else
+        echo "You are a sub-agent in an RLM chain at depth ${DEPTH}/${MAX_DEPTH}. You can spawn your own sub-agents if needed."
+        echo "Follow the task below. Print your answer to stdout."
+    fi
+    echo ""
+
+    # 3. Custom system prompt (task-level first, then global fallback)
+    if [ -f "${TASK_DIR}/system-prompt.md" ]; then
+        cat "${TASK_DIR}/system-prompt.md"
+        echo ""
+    elif [ -f "${CWD}/.rlm/system-prompt.md" ]; then
+        cat "${CWD}/.rlm/system-prompt.md"
+        echo ""
+    fi
+
+    # 4. Context info
+    if [ -n "$CONTEXT" ] && [ -f "$CONTEXT" ]; then
+        BYTES=$(wc -c < "$CONTEXT" | tr -d ' ')
+        LINES=$(wc -l < "$CONTEXT" | tr -d ' ')
+        cat << CTXEOF
+## Context
+- File: ${CONTEXT}
+- Size: ${BYTES} bytes, ${LINES} lines
+
+Preview (first 500 chars):
+\`\`\`
+$(head -c 500 "$CONTEXT" 2>/dev/null || true)
+\`\`\`
+
+Do not read the full context into your conversation. Slice it with bash tools (head, tail, sed, split).
+
+CTXEOF
+    fi
+
+    # 5. The task prompt (last — what the agent actually needs to do)
+    echo "## Your Task"
+    echo ""
+    cat "$PROMPT_FILE"
+} > "$SUB_PROMPT"
+
+# --- Write launcher script (avoids shell escaping issues) ---
+LAUNCHER="${SESSION_DIR}/launch.sh"
+cat > "$LAUNCHER" << 'LAUNCHEOF'
+#!/usr/bin/env bash
+set -uo pipefail
+
+# --- Concurrency limiter ---
+# Acquire a slot before running Claude. All agents in the task tree
+# share the same slots directory, so this limits total concurrent
+# Claude instances across all depths.
+
+SLOTS_DIR="__SLOTS_DIR__"
+MAX_PARALLEL="__MAX_PARALLEL__"
+
+acquire_slot() {
+    while true; do
+        for i in $(seq 1 "$MAX_PARALLEL"); do
+            local lockdir="${SLOTS_DIR}/slot_${i}.lock"
+            if mkdir "$lockdir" 2>/dev/null; then
+                echo $$ > "$lockdir/pid"
+                echo "$i"
+                return 0
+            fi
+            # Check for stale lock (holder process died)
+            local holder
+            holder=$(cat "$lockdir/pid" 2>/dev/null || echo "")
+            if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+                rm -rf "$lockdir"
+            fi
+        done
+        sleep 2
+    done
+}
+
+SLOT_NUM=$(acquire_slot)
+trap 'rm -rf "${SLOTS_DIR}/slot_${SLOT_NUM}.lock" 2>/dev/null' EXIT
+
+# --- Run Claude ---
+LAUNCHEOF
+
+# Now append the non-templated parts with variable expansion
+cat >> "$LAUNCHER" << EOF
+export PATH="${SCRIPT_DIR}:\${PATH}"
+export RLM_DEPTH=${NEXT_DEPTH}
+export RLM_MAX_DEPTH=${MAX_DEPTH}
+export RLM_TIMEOUT=${TIMEOUT}
+export RLM_MODEL='${MODEL}'
+export RLM_MAX_PARALLEL=${MAX_PARALLEL}
+export RLM_TASK='${TASK}'
+cd "${CWD}"
+${CLAUDE_CMD} -p "\$(cat '${SUB_PROMPT}')" > '${OUTPUT_FILE}' 2>'${SESSION_DIR}/stderr.log'
+touch '${SESSION_DIR}/.done'
+EOF
+
+# Replace placeholders in the literal section
+sed -i '' "s|__SLOTS_DIR__|${SLOTS_DIR}|g" "$LAUNCHER"
+sed -i '' "s|__MAX_PARALLEL__|${MAX_PARALLEL}|g" "$LAUNCHER"
+chmod +x "$LAUNCHER"
+
+# --- Launch in tmux ---
+tmux new-session -d -s "$SESSION_ID" "$LAUNCHER"
+echo "[rlm] Started ${SESSION_ID} (depth ${DEPTH}/${MAX_DEPTH}, parallel ${MAX_PARALLEL}, task: ${TASK})" >&2
+
+# --- Wait for completion with timeout ---
+ELAPSED=0
+while [ ! -f "${SESSION_DIR}/.done" ] && [ "$ELAPSED" -lt "$TIMEOUT" ]; do
+    sleep 2
+    ELAPSED=$((ELAPSED + 2))
+done
+
+if [ ! -f "${SESSION_DIR}/.done" ]; then
+    tmux kill-session -t "$SESSION_ID" 2>/dev/null || true
+    echo "ERROR: Sub-query timed out after ${TIMEOUT}s" > "$OUTPUT_FILE"
+    echo "[rlm] TIMEOUT ${SESSION_ID}" >&2
+    exit 1
+fi
+
+# Cleanup tmux session (keep session dir for debugging)
+tmux kill-session -t "$SESSION_ID" 2>/dev/null || true
+
+RESULT_SIZE=$(wc -c < "$OUTPUT_FILE" 2>/dev/null | tr -d ' ' || echo "0")
+echo "[rlm] Done ${SESSION_ID} -> ${OUTPUT_FILE} (${RESULT_SIZE} bytes)" >&2

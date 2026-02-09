@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# rlm-batch - Fan out multiple prompts to parallel sub-agents
+#
+# Takes a directory of prompt files and runs rlm-query on each in parallel.
+# Results appear in the output directory with matching filenames.
+
+set -euo pipefail
+
+if [ $# -lt 2 ]; then
+    cat >&2 << 'USAGE'
+rlm-batch - Parallel fan-out for RLM sub-agents
+
+Usage: rlm-batch <prompts_dir> <results_dir> [rlm-query options...]
+
+All .md files in prompts_dir are processed in parallel.
+Results are written to results_dir/<name>.out
+
+Extra flags are passed through to rlm-query (e.g. --context, --model, --timeout).
+
+Example:
+  rlm-batch .rlm/task/prompts .rlm/task/results --context big-file.txt
+USAGE
+    exit 1
+fi
+
+PROMPTS_DIR="$1"
+RESULTS_DIR="$2"
+shift 2
+
+mkdir -p "$RESULTS_DIR"
+
+# Collect all prompt files
+PROMPT_FILES=("$PROMPTS_DIR"/*.md)
+
+if [ ${#PROMPT_FILES[@]} -eq 0 ] || [ ! -f "${PROMPT_FILES[0]}" ]; then
+    echo "[rlm-batch] No .md files found in ${PROMPTS_DIR}" >&2
+    exit 1
+fi
+
+echo "[rlm-batch] Launching ${#PROMPT_FILES[@]} sub-agents in parallel" >&2
+
+# Launch all in parallel
+PIDS=()
+NAMES=()
+for prompt in "${PROMPT_FILES[@]}"; do
+    name=$(basename "$prompt" .md)
+    NAMES+=("$name")
+    rlm-query "$prompt" "${RESULTS_DIR}/${name}.out" "$@" &
+    PIDS+=($!)
+done
+
+# Wait for all and track failures
+FAILED=0
+for i in "${!PIDS[@]}"; do
+    if ! wait "${PIDS[$i]}"; then
+        echo "[rlm-batch] FAILED: ${NAMES[$i]}" >&2
+        FAILED=$((FAILED + 1))
+    fi
+done
+
+SUCCEEDED=$(( ${#PIDS[@]} - FAILED ))
+echo "[rlm-batch] Complete: ${SUCCEEDED}/${#PIDS[@]} succeeded" >&2
+
+if [ "$FAILED" -gt 0 ]; then
+    exit 1
+fi

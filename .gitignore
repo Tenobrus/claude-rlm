@@ -1,0 +1,39 @@
+# RLM session data
+.rlm/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.python-version
+
+# Environment / secrets
+.env
+
+# Claude Code
+.claude/
+
+# OS
+.DS_Store
+
+# Large test files
+frankenstein.txt
+
+# Cloned repos (use submodules or just link)
+benchmarks/oolong/oolong/
+benchmarks/s-niah/ruler/
+
+# Lock files
+uv.lock
+
+# Benchmark context files (too large, regenerate from HF)
+benchmarks/oolong/data/contexts/
+
+# Raw results and generated prompts
+benchmarks/oolong/results/
+benchmarks/oolong/data/prompt_*.md
+benchmarks/oolong/data/test_*
+benchmarks/s-niah/data/
+
+# Paper PDF (link to arxiv instead)
+*.pdf
